@@ -53,7 +53,7 @@ def guardar_usuarios(db):
         json.dump(db, f, indent=4)
 
 # ==========================================
-# 2. MOTOR DE EXTRACCIÓN LOCAL LOCALIZADO (LAS 180 PREGUNTAS COMPLETAS)
+# 2. MOTOR DE EXTRACCIÓN LOCAL UNIVERSAL (SIN IA)
 # ==========================================
 def extraer_texto_plano_con_paginas(ruta_archivo):
     texto_total = ""
@@ -100,13 +100,14 @@ def extraer_preguntas_local_pdf(ruta_archivo):
                         if "Examen Nacional de Medicina" not in l 
                         and "Página" not in l 
                         and "07 de diciembre" not in l
+                        and "Villamedic" not in l
                     ]
                     texto_total += "\n" + "\n".join(lineas_limpias) + "\n"
     elif ruta_archivo.lower().endswith((".pptx", ".ppt", ".png", ".jpg", ".jpeg")):
         texto_total = extraer_texto_plano_con_paginas(ruta_archivo)
 
-    # Regex optimizado para detectar la numeración exacta de las preguntas del ENAM
-    patron_pregunta = re.compile(r'(?:\n|^)\s*(\d{1,3})\.\s+')
+    # REGEX UNIVERSAL: Detecta números seguidos de punto o paréntesis (Ej: "1." o "144)")
+    patron_pregunta = re.compile(r'(?:\n|^)\s*(\d{1,4})[\.\)]\s+')
     splits = list(patron_pregunta.finditer(texto_total))
     
     banco_preguntas = []
@@ -117,8 +118,8 @@ def extraer_preguntas_local_pdf(ruta_archivo):
         
         bloque = texto_total[inicio_actual:fin_actual].strip()
         
-        # Separa el enunciado de las alternativas usando A., B., C., D., E. o con paréntesis
-        opciones_match = re.split(r'\n?\s*([A-E])[\.\)]\s+', bloque)
+        # REGEX UNIVERSAL: Detecta minúsculas y mayúsculas con punto o paréntesis (Ej: "A.", "a)", "B)")
+        opciones_match = re.split(r'\n?\s*([A-Ea-e])[\.\)]\s+', bloque)
         
         if len(opciones_match) >= 3:
             enunciado = opciones_match[0].strip()
@@ -126,14 +127,13 @@ def extraer_preguntas_local_pdf(ruta_archivo):
             
             opciones = []
             for j in range(1, len(opciones_match), 2):
-                letra = opciones_match[j]
+                letra = opciones_match[j].upper() # Normaliza todo a A, B, C, D, E
                 texto_op = opciones_match[j+1].strip()
                 texto_op = re.sub(r'\s*\n\s*', ' ', texto_op)
-                texto_op = re.sub(r'\n?\s*(?:Respuesta|Rpta|Clave)[\s\:\.]*[A-E].*$', '', texto_op, flags=re.IGNORECASE).strip()
+                texto_op = re.sub(r'\n?\s*(?:Respuesta|Rpta|Clave|EsSalud)[\s\:\.]*[A-Ea-e].*$', '', texto_op, flags=re.IGNORECASE).strip()
                 
-                # CORRECCIÓN AUTOMÁTICA DE COLUMNAS: Si la opción A arranca con texto sobrante del enunciado (ej: sin terminar en signo de interrogación o dos puntos), se lo devolvemos al enunciado
+                # CORRECCIÓN DE COLUMNAS
                 if letra == 'A' and not re.search(r'[\?\:]\s*$', enunciado) and len(texto_op) > 40:
-                    # Buscamos un punto o espacio lógico donde se cortó la premisa
                     corte_idx = max(texto_op.rfind('.'), texto_op.rfind('?'), texto_op.rfind(':'))
                     if corte_idx != -1 and corte_idx < len(texto_op) // 2:
                         enunciado += " " + texto_op[:corte_idx+1]
@@ -142,7 +142,7 @@ def extraer_preguntas_local_pdf(ruta_archivo):
                 opciones.append(f"{letra}) {texto_op}")
             
             if len(opciones) >= 3:
-                match_resp = re.search(r'(?:Respuesta|Rpta|Clave)[\s\:\.]*([A-E])', bloque, re.IGNORECASE)
+                match_resp = re.search(r'(?:Respuesta|Rpta|Clave)[\s\:\.]*([A-Ea-e])', bloque, re.IGNORECASE)
                 clave_real = match_resp.group(1).upper() if match_resp else "N/A"
                 
                 enunciado_lower = enunciado.lower()
@@ -151,7 +151,7 @@ def extraer_preguntas_local_pdf(ruta_archivo):
                     especialidad = "Pediatría"
                 elif any(k in enunciado_lower for k in ["gestante", "embarazada", "útero", "parto", "puerperio", "cérvix", "placenta", "primigesta"]): 
                     especialidad = "Gineco-Obstetricia"
-                elif any(k in enunciado_lower for k in ["dolor abdominal", "cirugía", "apendicitis", "hernia", "colecistitis", "obstrucción"]): 
+                elif any(k in enunciado_lower for k in ["dolor abdominal", "cirugía", "apendicitis", "hernia", "colecistitis", "obstrucción", "litiasis", "vesícula"]): 
                     especialidad = "Cirugía General"
                 elif any(k in enunciado_lower for k in ["fiebre", "tos", "disnea", "pulmón", "infarto", "diabetes", "anemia", "presión", "paro"]): 
                     especialidad = "Medicina Interna"
@@ -257,7 +257,7 @@ def main_app():
                     with open(ruta_raw, "wb") as f:
                         f.write(archivo.getbuffer())
 
-                    barra.progress(30, text=f"Procesando banco completo al 100%...")
+                    barra.progress(30, text=f"Extrayendo texto de {archivo.name}...")
 
                     if tipo_subida == "Banco de Preguntas":
                         preguntas = extraer_preguntas_local_pdf(ruta_raw)
@@ -452,7 +452,7 @@ def main_app():
                         with open(ruta_json, "r", encoding="utf-8") as f:
                             preguntas_extraidas = json.load(f)
                     else:
-                        with st.spinner("Procesando las 180 preguntas completas..."):
+                        with st.spinner("Procesando banco completo de forma local..."):
                             preguntas_extraidas = extraer_preguntas_local_pdf(ruta_completa)
                             with open(ruta_json, "w", encoding="utf-8") as f:
                                 json.dump(preguntas_extraidas, f, ensure_ascii=False, indent=4)
