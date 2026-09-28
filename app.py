@@ -53,14 +53,47 @@ def guardar_usuarios(db):
         json.dump(db, f, indent=4)
 
 # ==========================================
-# 2. MOTOR DE EXTRACCIÓN LOCAL UNIVERSAL (SIN IA)
+# 2. MOTOR DE EXTRACCIÓN INTELIGENTE CON AUTODETECCIÓN DE COLUMNAS
 # ==========================================
+def leer_pagina_inteligente(pagina):
+    """Detecta automáticamente si la página tiene 1 o 2 columnas y extrae el texto en el orden correcto."""
+    ancho = pagina.width
+    alto = pagina.height
+    
+    palabras = pagina.extract_words()
+    if not palabras:
+        return pagina.extract_text() or ""
+        
+    # Definimos una "zona muerta" en el centro de la página (margen del 45% al 55%)
+    zona_muerta_izq = ancho * 0.45
+    zona_muerta_der = ancho * 0.55
+    
+    cruza_centro = False
+    for p in palabras:
+        # Si una palabra empieza antes del centro y termina después, es de 1 sola columna
+        if p['x0'] < zona_muerta_izq and p['x1'] > zona_muerta_der:
+            cruza_centro = True
+            break
+            
+    if cruza_centro:
+        # Extraer como 1 sola columna
+        return pagina.extract_text() or ""
+    else:
+        # Extraer como 2 columnas (primero la mitad izquierda, luego la derecha)
+        caja_izq = (0, 0, ancho * 0.5, alto)
+        caja_der = (ancho * 0.5, 0, ancho, alto)
+        
+        texto_izq = pagina.crop(caja_izq).extract_text() or ""
+        texto_der = pagina.crop(caja_der).extract_text() or ""
+        
+        return texto_izq + "\n" + texto_der
+
 def extraer_texto_plano_con_paginas(ruta_archivo):
     texto_total = ""
     if ruta_archivo.lower().endswith(".pdf"):
         with pdfplumber.open(ruta_archivo) as pdf:
             for i, pagina in enumerate(pdf.pages):
-                t = pagina.extract_text()
+                t = leer_pagina_inteligente(pagina)
                 if t:
                     texto_total += f"\n[Página interna del PDF: {i+1}] {t}\n"
     elif ruta_archivo.lower().endswith((".pptx", ".ppt")):
@@ -73,13 +106,11 @@ def extraer_texto_plano_con_paginas(ruta_archivo):
         try:
             from PIL import Image
             import google.generativeai as genai
-            
             api_key = st.secrets.get("GOOGLE_API_KEY", "")
             genai.configure(api_key=api_key)
             modelo_vision = genai.GenerativeModel('gemini-1.5-flash')
-            
             img = Image.open(ruta_archivo)
-            prompt_ocr = "Extrae todo el texto, tablas y datos médicos de esta imagen con detalle."
+            prompt_ocr = "Extrae todo el texto de esta imagen con sumo detalle."
             respuesta = modelo_vision.generate_content([prompt_ocr, img])
             texto_total += f"\n[Contenido extraído de Imagen: {os.path.basename(ruta_archivo)}]\n{respuesta.text}\n"
         except Exception as e:
@@ -92,7 +123,7 @@ def extraer_preguntas_local_pdf(ruta_archivo):
     if ruta_archivo.lower().endswith(".pdf"):
         with pdfplumber.open(ruta_archivo) as pdf:
             for i, pagina in enumerate(pdf.pages):
-                t = pagina.extract_text()
+                t = leer_pagina_inteligente(pagina)
                 if t: 
                     lineas = t.split("\n")
                     lineas_limpias = [
@@ -106,7 +137,7 @@ def extraer_preguntas_local_pdf(ruta_archivo):
     elif ruta_archivo.lower().endswith((".pptx", ".ppt", ".png", ".jpg", ".jpeg")):
         texto_total = extraer_texto_plano_con_paginas(ruta_archivo)
 
-    # REGEX UNIVERSAL: Detecta números seguidos de punto o paréntesis (Ej: "1." o "144)")
+    # REGEX UNIVERSAL: Detecta números seguidos de punto o paréntesis
     patron_pregunta = re.compile(r'(?:\n|^)\s*(\d{1,4})[\.\)]\s+')
     splits = list(patron_pregunta.finditer(texto_total))
     
@@ -118,7 +149,7 @@ def extraer_preguntas_local_pdf(ruta_archivo):
         
         bloque = texto_total[inicio_actual:fin_actual].strip()
         
-        # REGEX UNIVERSAL: Detecta minúsculas y mayúsculas con punto o paréntesis (Ej: "A.", "a)", "B)")
+        # REGEX UNIVERSAL: Detecta minúsculas y mayúsculas con punto o paréntesis (A., a), B))
         opciones_match = re.split(r'\n?\s*([A-Ea-e])[\.\)]\s+', bloque)
         
         if len(opciones_match) >= 3:
@@ -127,12 +158,12 @@ def extraer_preguntas_local_pdf(ruta_archivo):
             
             opciones = []
             for j in range(1, len(opciones_match), 2):
-                letra = opciones_match[j].upper() # Normaliza todo a A, B, C, D, E
+                letra = opciones_match[j].upper()
                 texto_op = opciones_match[j+1].strip()
                 texto_op = re.sub(r'\s*\n\s*', ' ', texto_op)
                 texto_op = re.sub(r'\n?\s*(?:Respuesta|Rpta|Clave|EsSalud)[\s\:\.]*[A-Ea-e].*$', '', texto_op, flags=re.IGNORECASE).strip()
                 
-                # CORRECCIÓN DE COLUMNAS
+                # REGLA DE LIMPIEZA: Si se coló un trozo del enunciado en la A
                 if letra == 'A' and not re.search(r'[\?\:]\s*$', enunciado) and len(texto_op) > 40:
                     corte_idx = max(texto_op.rfind('.'), texto_op.rfind('?'), texto_op.rfind(':'))
                     if corte_idx != -1 and corte_idx < len(texto_op) // 2:
@@ -147,11 +178,11 @@ def extraer_preguntas_local_pdf(ruta_archivo):
                 
                 enunciado_lower = enunciado.lower()
                 especialidad = "Medicina General"
-                if any(k in enunciado_lower for k in ["niño", "infante", "recién nacido", "lactante", "pediatra", "neonato", "preescolar", "escolar"]): 
+                if any(k in enunciado_lower for k in ["niño", "infante", "recién nacido", "lactante", "pediatra", "neonato", "preescolar"]): 
                     especialidad = "Pediatría"
-                elif any(k in enunciado_lower for k in ["gestante", "embarazada", "útero", "parto", "puerperio", "cérvix", "placenta", "primigesta"]): 
+                elif any(k in enunciado_lower for k in ["gestante", "embarazada", "útero", "parto", "puerperio", "cérvix", "placenta"]): 
                     especialidad = "Gineco-Obstetricia"
-                elif any(k in enunciado_lower for k in ["dolor abdominal", "cirugía", "apendicitis", "hernia", "colecistitis", "obstrucción", "litiasis", "vesícula"]): 
+                elif any(k in enunciado_lower for k in ["dolor abdominal", "cirugía", "apendicitis", "hernia", "colecistitis", "obstrucción", "litiasis"]): 
                     especialidad = "Cirugía General"
                 elif any(k in enunciado_lower for k in ["fiebre", "tos", "disnea", "pulmón", "infarto", "diabetes", "anemia", "presión", "paro"]): 
                     especialidad = "Medicina Interna"
@@ -257,7 +288,7 @@ def main_app():
                     with open(ruta_raw, "wb") as f:
                         f.write(archivo.getbuffer())
 
-                    barra.progress(30, text=f"Extrayendo texto de {archivo.name}...")
+                    barra.progress(30, text=f"Procesando banco y evaluando columnas...")
 
                     if tipo_subida == "Banco de Preguntas":
                         preguntas = extraer_preguntas_local_pdf(ruta_raw)
