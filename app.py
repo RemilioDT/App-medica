@@ -53,10 +53,10 @@ def guardar_usuarios(db):
         json.dump(db, f, indent=4)
 
 # ==========================================
-# 2. MOTOR DE EXTRACCIÓN INTELIGENTE CON AUTODETECCIÓN DE COLUMNAS
+# 2. MOTOR DE EXTRACCIÓN INTELIGENTE DE COLUMNAS
 # ==========================================
 def leer_pagina_inteligente(pagina):
-    """Detecta automáticamente si la página tiene 1 o 2 columnas y extrae el texto en el orden correcto."""
+    """Detecta automáticamente columnas ignorando encabezados largos."""
     ancho = pagina.width
     alto = pagina.height
     
@@ -64,22 +64,16 @@ def leer_pagina_inteligente(pagina):
     if not palabras:
         return pagina.extract_text() or ""
         
-    # Definimos una "zona muerta" en el centro de la página (margen del 45% al 55%)
     zona_muerta_izq = ancho * 0.45
     zona_muerta_der = ancho * 0.55
     
-    cruza_centro = False
-    for p in palabras:
-        # Si una palabra empieza antes del centro y termina después, es de 1 sola columna
-        if p['x0'] < zona_muerta_izq and p['x1'] > zona_muerta_der:
-            cruza_centro = True
-            break
-            
-    if cruza_centro:
-        # Extraer como 1 sola columna
-        return pagina.extract_text() or ""
-    else:
-        # Extraer como 2 columnas (primero la mitad izquierda, luego la derecha)
+    # Ignoramos el 8% superior e inferior para que los encabezados largos no arruinen la detección de columnas
+    palabras_centro = [p for p in palabras if p['top'] > alto * 0.08 and p['bottom'] < alto * 0.92]
+    
+    cruza_centro = sum(1 for p in palabras_centro if p['x0'] < zona_muerta_izq and p['x1'] > zona_muerta_der)
+    
+    # Si muy pocas palabras cruzan el centro de la página, es un PDF de 2 columnas seguro
+    if cruza_centro <= 4:
         caja_izq = (0, 0, ancho * 0.5, alto)
         caja_der = (ancho * 0.5, 0, ancho, alto)
         
@@ -87,6 +81,8 @@ def leer_pagina_inteligente(pagina):
         texto_der = pagina.crop(caja_der).extract_text() or ""
         
         return texto_izq + "\n" + texto_der
+    else:
+        return pagina.extract_text() or ""
 
 def extraer_texto_plano_con_paginas(ruta_archivo):
     texto_total = ""
@@ -110,7 +106,7 @@ def extraer_texto_plano_con_paginas(ruta_archivo):
             genai.configure(api_key=api_key)
             modelo_vision = genai.GenerativeModel('gemini-1.5-flash')
             img = Image.open(ruta_archivo)
-            prompt_ocr = "Extrae todo el texto de esta imagen con sumo detalle."
+            prompt_ocr = "Extrae todo el texto, tablas y datos médicos de esta imagen con detalle."
             respuesta = modelo_vision.generate_content([prompt_ocr, img])
             texto_total += f"\n[Contenido extraído de Imagen: {os.path.basename(ruta_archivo)}]\n{respuesta.text}\n"
         except Exception as e:
@@ -137,7 +133,7 @@ def extraer_preguntas_local_pdf(ruta_archivo):
     elif ruta_archivo.lower().endswith((".pptx", ".ppt", ".png", ".jpg", ".jpeg")):
         texto_total = extraer_texto_plano_con_paginas(ruta_archivo)
 
-    # REGEX UNIVERSAL: Detecta números seguidos de punto o paréntesis
+    # Detecta números de pregunta seguidos de punto o paréntesis
     patron_pregunta = re.compile(r'(?:\n|^)\s*(\d{1,4})[\.\)]\s+')
     splits = list(patron_pregunta.finditer(texto_total))
     
@@ -149,27 +145,26 @@ def extraer_preguntas_local_pdf(ruta_archivo):
         
         bloque = texto_total[inicio_actual:fin_actual].strip()
         
-        # REGEX UNIVERSAL: Detecta minúsculas y mayúsculas con punto o paréntesis (A., a), B))
-        opciones_match = re.split(r'\n?\s*([A-Ea-e])[\.\)]\s+', bloque)
+        # Regex universal con límite de palabra (\b) para evitar cortar palabras como "fiebre)"
+        opciones_match = re.split(r'\b([A-Ea-e])[\.\)]\s+', bloque)
         
         if len(opciones_match) >= 3:
             enunciado = opciones_match[0].strip()
             enunciado = re.sub(r'\s+', ' ', enunciado)
             
             opciones = []
+            letras_vistas = set() # Evita duplicar opciones si el PDF cruza líneas
             for j in range(1, len(opciones_match), 2):
                 letra = opciones_match[j].upper()
                 texto_op = opciones_match[j+1].strip()
                 texto_op = re.sub(r'\s*\n\s*', ' ', texto_op)
                 texto_op = re.sub(r'\n?\s*(?:Respuesta|Rpta|Clave|EsSalud)[\s\:\.]*[A-Ea-e].*$', '', texto_op, flags=re.IGNORECASE).strip()
                 
-                # REGLA DE LIMPIEZA: Si se coló un trozo del enunciado en la A
-                if letra == 'A' and not re.search(r'[\?\:]\s*$', enunciado) and len(texto_op) > 40:
-                    corte_idx = max(texto_op.rfind('.'), texto_op.rfind('?'), texto_op.rfind(':'))
-                    if corte_idx != -1 and corte_idx < len(texto_op) // 2:
-                        enunciado += " " + texto_op[:corte_idx+1]
-                        texto_op = texto_op[corte_idx+1:].strip()
-
+                # Omitir letra si ya se agregó, previniendo deformaciones
+                if letra in letras_vistas:
+                    continue
+                letras_vistas.add(letra)
+                
                 opciones.append(f"{letra}) {texto_op}")
             
             if len(opciones) >= 3:
@@ -288,7 +283,7 @@ def main_app():
                     with open(ruta_raw, "wb") as f:
                         f.write(archivo.getbuffer())
 
-                    barra.progress(30, text=f"Procesando banco y evaluando columnas...")
+                    barra.progress(30, text=f"Procesando y corrigiendo columnas y alternativas...")
 
                     if tipo_subida == "Banco de Preguntas":
                         preguntas = extraer_preguntas_local_pdf(ruta_raw)
