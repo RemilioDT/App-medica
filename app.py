@@ -53,7 +53,7 @@ def guardar_usuarios(db):
         json.dump(db, f, indent=4)
 
 # ==========================================
-# 2. MOTOR DE EXTRACCIÓN INTELIGENTE CON IA (ANTI-COLUMNAS)
+# 2. MOTOR DE EXTRACCIÓN INTELIGENTE PÁGINA POR PÁGINA (ANTI-ENTRELAZADO DE COLUMNAS)
 # ==========================================
 def extraer_texto_plano_con_paginas(ruta_archivo):
     texto_total = ""
@@ -89,67 +89,85 @@ def extraer_texto_plano_con_paginas(ruta_archivo):
     return texto_total
 
 def extraer_preguntas_local_pdf(ruta_archivo):
-    texto_total = ""
+    banco_preguntas = []
+    
     if ruta_archivo.lower().endswith(".pdf"):
         with pdfplumber.open(ruta_archivo) as pdf:
+            total_paginas = len(pdf.pages)
             for i, pagina in enumerate(pdf.pages):
                 t = pagina.extract_text()
-                if t: 
-                    lineas = t.split("\n")
-                    lineas_limpias = [
-                        l for l in lineas 
-                        if "Examen Nacional de Medicina" not in l 
-                        and "Página" not in l 
-                        and "07 de diciembre" not in l
-                    ]
-                    texto_total += "\n" + "\n".join(lineas_limpias) + "\n"
+                if not t:
+                    continue
+                
+                # Limpiar encabezados y pies de página repetitivos
+                lineas = t.split("\n")
+                lineas_limpias = [
+                    l for l in lineas 
+                    if "Examen Nacional de Medicina" not in l 
+                    and "Página" not in l 
+                    and "07 de diciembre" not in l
+                ]
+                texto_pagina = "\n".join(lineas_limpias)
+                
+                # Prompt altamente especializado para corregir el desorden de 2 columnas por página
+                prompt_parser = f"""
+                Eres un procesador experto de exámenes médicos oficiales (ENAM). 
+                El texto a continuación corresponde a la PÁGINA {i+1} de {total_paginas} de un PDF maquetado a DOS COLUMNAS. Debido a esto, las líneas de texto pueden haberse mezclado horizontalmente.
+                Tu tarea es leer cuidadosamente el texto, desentrañar el entrelazado de columnas y reconstruir de forma perfecta y lógica cada una de las preguntas de opción múltiple presentes en esta página.
+                
+                REGLAS ESTRICTAS:
+                1. ENUNCIADO Y PREGUNTA: El caso clínico y la pregunta final (que suele terminar con '?' o ':' introduciendo la interrogación) deben pertenecer íntegramente al campo "pregunta". NUNCA dejes que parte del enunciado se mezcle o caiga dentro de la opción A.
+                2. ALTERNATIVAS: Extrae únicamente las opciones reales (A, B, C, D, E) asociadas a cada pregunta. No inventes opciones vacías ni alteres su orden.
+                3. CLAVE: Identifica si el texto menciona alguna clave o respuesta correcta (ej. "Clave: B" o "Rpta: A"). Si no aparece, pon "N/A".
+                4. ESPECIALIDAD: Clasifica la especialidad médica correspondiente (Medicina Interna, Cirugía General, Pediatría, Gineco-Obstetricia, Salud Pública, etc.).
+                5. FORMATO: Devuelve ÚNICAMENTE un JSON válido que sea una lista de objetos, sin bloques de código markdown ni texto adicional:
+                [
+                  {{
+                    "pregunta": "Texto completo y ordenado de la pregunta...",
+                    "opciones": ["A) ...", "B) ...", "C) ...", "D) ...", "E) ..."],
+                    "correcta": "Letra o N/A",
+                    "especialidad": "Especialidad"
+                  }}
+                ]
+
+                TEXTO DE LA PÁGINA:
+                {texto_pagina}
+                """
+                
+                try:
+                    texto_resp, _ = generar_respuesta_con_fallback(prompt_parser)
+                    t_limpio = texto_resp.strip()
+                    
+                    if "```json" in t_limpio:
+                        t_limpio = t_limpio.split("```json")[1].split("```")[0].strip()
+                    elif "```" in t_limpio:
+                        t_limpio = t_limpio.split("```")[1].split("```")[0].strip()
+                    
+                    inicio, fin = t_limpio.find("["), t_limpio.rfind("]")
+                    if inicio != -1 and fin != -1:
+                        parcial = json.loads(t_limpio[inicio:fin+1])
+                        if isinstance(parcial, list):
+                            banco_preguntas.extend(parcial)
+                except Exception:
+                    continue
+                    
     elif ruta_archivo.lower().endswith((".pptx", ".ppt", ".png", ".jpg", ".jpeg")):
         texto_total = extraer_texto_plano_con_paginas(ruta_archivo)
-
-    # PARSER HÍBRIDO POR BLOQUES CON IA: Reconstruye las columnas desordenadas del PDF oficial
-    tamano_chunk = 6000
-    chunks = [texto_total[i:i+tamano_chunk] for i in range(0, len(texto_total), tamano_chunk)]
-    banco_preguntas = []
-
-    for idx, chunk in enumerate(chunks):
+        # Lógica de respaldo si se sube otro formato
         prompt_parser = f"""
-        Eres un procesador experto de exámenes médicos oficiales (ENAM). El texto proviene de un PDF a dos columnas, por lo que algunas líneas pueden estar entremezcladas.
-        Analiza el siguiente fragmento (bloque {idx+1} de {len(chunks)}) y extrae TODAS las preguntas de opción múltiple.
-        
-        REGLAS CRÍTICAS:
-        1. SEPARA correctamente el ENUNCIADO de la pregunta y las ALTERNATIVAS (A, B, C, D, E). El texto que pertenece al enunciado de la pregunta NUNCA debe meterse dentro de la opción A.
-        2. Mantén las opciones completas y en orden.
-        3. Identifica la clave si viene en el texto, o pon "N/A".
-        4. Clasifica la especialidad médica (Medicina Interna, Cirugía General, Pediatría, Gineco-Obstetricia, etc.).
-        5. DEVUELVE ÚNICAMENTE UN JSON VÁLIDO (una lista de objetos), sin bloques de código markdown ni texto adicional:
-        [
-          {{
-            "pregunta": "Enunciado completo y limpio...",
-            "opciones": ["A) ...", "B) ...", "C) ...", "D) ...", "E) ..."],
-            "correcta": "Letra o N/A",
-            "especialidad": "Especialidad"
-          }}
-        ]
-
-        TEXTO A ANALIZAR:
-        {chunk}
+        Extrae todas las preguntas de opción múltiple del siguiente texto y devuélvelas estrictamente en formato JSON de lista de objetos con las llaves "pregunta", "opciones", "correcta" y "especialidad":
+        {texto_total}
         """
         try:
             texto_resp, _ = generar_respuesta_con_fallback(prompt_parser)
             t_limpio = texto_resp.strip()
-            
             if "```json" in t_limpio:
                 t_limpio = t_limpio.split("```json")[1].split("```")[0].strip()
-            elif "```" in t_limpio:
-                t_limpio = t_limpio.split("```")[1].split("```")[0].strip()
-            
-            i, j = t_limpio.find("["), t_limpio.rfind("]")
-            if i != -1 and j != -1:
-                parcial = json.loads(t_limpio[i:j+1])
-                if isinstance(parcial, list):
-                    banco_preguntas.extend(parcial)
+            inicio, fin = t_limpio.find("["), t_limpio.rfind("]")
+            if inicio != -1 and fin != -1:
+                banco_preguntas = json.loads(t_limpio[inicio:fin+1])
         except Exception:
-            continue
+            pass
 
     return banco_preguntas
 
@@ -245,7 +263,7 @@ def main_app():
                     with open(ruta_raw, "wb") as f:
                         f.write(archivo.getbuffer())
 
-                    barra.progress(30, text=f"Extrayendo texto y páginas de {archivo.name}...")
+                    barra.progress(30, text=f"Procesando y corrigiendo columnas de {archivo.name}...")
 
                     if tipo_subida == "Banco de Preguntas":
                         preguntas = extraer_preguntas_local_pdf(ruta_raw)
@@ -440,7 +458,7 @@ def main_app():
                         with open(ruta_json, "r", encoding="utf-8") as f:
                             preguntas_extraidas = json.load(f)
                     else:
-                        with st.spinner("Procesando y ordenando columnas con IA..."):
+                        with st.spinner("Procesando y corrigiendo columnas página por página..."):
                             preguntas_extraidas = extraer_preguntas_local_pdf(ruta_completa)
                             with open(ruta_json, "w", encoding="utf-8") as f:
                                 json.dump(preguntas_extraidas, f, ensure_ascii=False, indent=4)
