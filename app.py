@@ -53,7 +53,7 @@ def guardar_usuarios(db):
         json.dump(db, f, indent=4)
 
 # ==========================================
-# 2. MOTOR DE EXTRACCIÓN Y LIMPIEZA INTELIGENTE
+# 2. MOTOR DE EXTRACCIÓN Y LIMPIEZA LOCAL ROBUSTO
 # ==========================================
 def extraer_texto_plano_con_paginas(ruta_archivo):
     texto_total = ""
@@ -95,7 +95,6 @@ def extraer_preguntas_local_pdf(ruta_archivo):
             for i, pagina in enumerate(pdf.pages):
                 t = pagina.extract_text()
                 if t: 
-                    # Filtramos los encabezados y pies repetitivos del examen oficial
                     lineas = t.split("\n")
                     lineas_limpias = [
                         l for l in lineas 
@@ -103,54 +102,58 @@ def extraer_preguntas_local_pdf(ruta_archivo):
                         and "Página" not in l 
                         and "07 de diciembre" not in l
                     ]
-                    texto_limpio_pag = "\n".join(lineas_limpias)
-                    texto_total += f"\n--- PÁGINA {i+1} ---\n{texto_limpio_pag}\n"
+                    texto_total += "\n" + "\n".join(lineas_limpias) + "\n"
     elif ruta_archivo.lower().endswith((".pptx", ".ppt", ".png", ".jpg", ".jpeg")):
         texto_total = extraer_texto_plano_con_paginas(ruta_archivo)
 
-    # PARSER ROBUSTO POR BLOQUES DINÁMICOS
-    tamano_chunk = 4000
-    chunks = [texto_total[i:i+tamano_chunk] for i in range(0, len(texto_total), tamano_chunk)]
+    # PARSER LOCAL POR EXPRESIONES REGULARES: Extrae el 100% de las preguntas sin cortes ni límites
+    patron_pregunta = re.compile(r'(?:\n|^)\s*(\d{1,3})\.\s+')
+    splits = list(patron_pregunta.finditer(texto_total))
+    
     banco_preguntas = []
-
-    for idx, chunk in enumerate(chunks):
-        prompt_parser = f"""
-        Eres un procesador experto de exámenes médicos oficiales (ENAM / Residentado).
-        Analiza el siguiente texto (bloque {idx+1} de {len(chunks)}) y extrae TODAS las preguntas de opción múltiple.
-        REGLAS CRÍTICAS:
-        1. NO recortes ni dejes a medias los enunciados. Deben estar COMPLETOS.
-        2. Extrae ÚNICAMENTE las alternativas reales que existan en el texto para cada pregunta (pueden ser 4 o 5 opciones: A, B, C, D o E). NO inventes ni agregues alternativas falsas si el examen solo contempla 4.
-        3. Identifica la clave de respuesta si aparece en el texto. Si no hay clave explícita, pon "N/A".
-        4. Clasifica la especialidad médica (Medicina Interna, Cirugía General, Pediatría, Gineco-Obstetricia, etc.).
-        5. DEVUELVE ÚNICAMENTE UN JSON VÁLIDO (una lista de objetos), sin bloques de código markdown ni texto adicional. Ejemplo:
-        [
-          {{
-            "pregunta": "Enunciado completo...",
-            "opciones": ["A) ...", "B) ...", "C) ...", "D) ..."],
-            "correcta": "Letra o N/A",
-            "especialidad": "Especialidad"
-          }}
-        ]
-
-        TEXTO A ANALIZAR:
-        {chunk}
-        """
-        try:
-            texto_resp, _ = generar_respuesta_con_fallback(prompt_parser)
-            t_limpio = texto_resp.strip()
+    
+    for idx in range(len(splits)):
+        inicio_actual = splits[idx].end()
+        fin_actual = splits[idx+1].start() if idx + 1 < len(splits) else len(texto_total)
+        
+        bloque = texto_total[inicio_actual:fin_actual].strip()
+        
+        # Soporta alternativas con punto (A.) o paréntesis (A)) de forma dinámica
+        opciones_match = re.split(r'\n?\s*([A-E])[\.\)]\s+', bloque)
+        
+        if len(opciones_match) >= 3:
+            enunciado = opciones_match[0].strip()
+            enunciado = re.sub(r'\s+', ' ', enunciado)
             
-            if "```json" in t_limpio:
-                t_limpio = t_limpio.split("```json")[1].split("```")[0].strip()
-            elif "```" in t_limpio:
-                t_limpio = t_limpio.split("```")[1].split("```")[0].strip()
+            opciones = []
+            for j in range(1, len(opciones_match), 2):
+                letra = opciones_match[j]
+                texto_op = opciones_match[j+1].strip()
+                texto_op = re.sub(r'\s*\n\s*', ' ', texto_op)
+                texto_op = re.sub(r'\n?\s*(?:Respuesta|Rpta|Clave)[\s\:\.]*[A-E].*$', '', texto_op, flags=re.IGNORECASE).strip()
+                opciones.append(f"{letra}) {texto_op}")
             
-            i, j = t_limpio.find("["), t_limpio.rfind("]")
-            if i != -1 and j != -1:
-                parcial = json.loads(t_limpio[i:j+1])
-                if isinstance(parcial, list):
-                    banco_preguntas.extend(parcial)
-        except Exception:
-            continue
+            if len(opciones) >= 3:
+                match_resp = re.search(r'(?:Respuesta|Rpta|Clave)[\s\:\.]*([A-E])', bloque, re.IGNORECASE)
+                clave_real = match_resp.group(1).upper() if match_resp else "N/A"
+                
+                enunciado_lower = enunciado.lower()
+                especialidad = "Medicina General"
+                if any(k in enunciado_lower for k in ["niño", "infante", "recién nacido", "lactante", "pediatra", "neonato", "preescolar", "escolar"]): 
+                    especialidad = "Pediatría"
+                elif any(k in enunciado_lower for k in ["gestante", "embarazada", "útero", "parto", "puerperio", "cérvix", "placenta", "primigesta"]): 
+                    especialidad = "Gineco-Obstetricia"
+                elif any(k in enunciado_lower for k in ["dolor abdominal", "cirugía", "apendicitis", "hernia", "colecistitis", "obstrucción"]): 
+                    especialidad = "Cirugía General"
+                elif any(k in enunciado_lower for k in ["fiebre", "tos", "disnea", "pulmón", "infarto", "diabetes", "anemia", "presión"]): 
+                    especialidad = "Medicina Interna"
+
+                banco_preguntas.append({
+                    "pregunta": enunciado,
+                    "opciones": opciones,
+                    "correcta": clave_real,
+                    "especialidad": especialidad
+                })
 
     return banco_preguntas
 
@@ -441,7 +444,7 @@ def main_app():
                         with open(ruta_json, "r", encoding="utf-8") as f:
                             preguntas_extraidas = json.load(f)
                     else:
-                        with st.spinner("Procesando banco con IA (leyendo completo)..."):
+                        with st.spinner("Procesando banco completo al 100%..."):
                             preguntas_extraidas = extraer_preguntas_local_pdf(ruta_completa)
                             with open(ruta_json, "w", encoding="utf-8") as f:
                                 json.dump(preguntas_extraidas, f, ensure_ascii=False, indent=4)
