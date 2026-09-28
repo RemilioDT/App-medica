@@ -53,25 +53,22 @@ def guardar_usuarios(db):
         json.dump(db, f, indent=4)
 
 # ==========================================
-# 2. MOTOR DE EXTRACCIÓN Y LIMPIEZA
+# 2. MOTOR DE EXTRACCIÓN Y LIMPIEZA INTELIGENTE
 # ==========================================
 def extraer_texto_plano_con_paginas(ruta_archivo):
     texto_total = ""
-    # CÓDIGO INTACTO PARA PDF
     if ruta_archivo.lower().endswith(".pdf"):
         with pdfplumber.open(ruta_archivo) as pdf:
             for i, pagina in enumerate(pdf.pages):
                 t = pagina.extract_text()
                 if t:
                     texto_total += f"\n[Página interna del PDF: {i+1}] {t}\n"
-    # CÓDIGO INTACTO PARA PPTX
     elif ruta_archivo.lower().endswith((".pptx", ".ppt")):
         prs = Presentation(ruta_archivo)
         for i, slide in enumerate(prs.slides):
             for shape in slide.shapes:
                 if hasattr(shape, "text"):
                     texto_total += f"\n[Diapositiva {i+1}] {shape.text}\n"
-    # NUEVO: LECTOR DE IMÁGENES MULTIMODAL
     elif ruta_archivo.lower().endswith((".png", ".jpg", ".jpeg")):
         try:
             from PIL import Image
@@ -95,55 +92,59 @@ def extraer_preguntas_local_pdf(ruta_archivo):
     texto_total = ""
     if ruta_archivo.lower().endswith(".pdf"):
         with pdfplumber.open(ruta_archivo) as pdf:
-            for pagina in pdf.pages:
-                ancho = pagina.width
-                alto = pagina.height
-                caja_izq = (0, 0, ancho * 0.5, alto)
-                texto_izq = pagina.crop(caja_izq).extract_text()
-                if texto_izq: texto_total += texto_izq + "\n"
-
-                caja_der = (ancho * 0.5, 0, ancho, alto)
-                texto_der = pagina.crop(caja_der).extract_text()
-                if texto_der: texto_total += texto_der + "\n"
-    # Redirecciona imágenes y PPTX al extractor general
+            for i, pagina in enumerate(pdf.pages):
+                t = pagina.extract_text()
+                if t: 
+                    texto_total += f"\n[Página {i+1}]\n{t}\n"
     elif ruta_archivo.lower().endswith((".pptx", ".ppt", ".png", ".jpg", ".jpeg")):
         texto_total = extraer_texto_plano_con_paginas(ruta_archivo)
 
-    bloques = re.split(r'(?:\n|^)\s*(\d{1,3})\.\s+', texto_total)
+    # PARSER ROBUSTO POR BLOQUES: Evita que las preguntas o respuestas se corten a la mitad
+    tamano_chunk = 8000
+    chunks = [texto_total[i:i+tamano_chunk] for i in range(0, len(texto_total), tamano_chunk)]
     banco_preguntas = []
 
-    for i in range(1, len(bloques), 2):
-        if i + 1 < len(bloques):
-            cuerpo = bloques[i+1]
-            opciones_match = re.split(r'\n\s*([A-E])[\)\.]\s+', cuerpo)
+    for chunk in chunks:
+        prompt_parser = f"""
+        Eres un procesador experto de exámenes médicos (ENAM / Residentado).
+        Analiza el siguiente fragmento de texto de un banco de preguntas y extrae TODAS las preguntas de opción múltiple.
+        REGLAS CRÍTICAS:
+        1. NO recortes ni dejes a medias los enunciados ni las opciones. Deben estar COMPLETOS.
+        2. Cada pregunta debe tener sus 5 opciones (A, B, C, D, E) completas.
+        3. Identifica la clave de respuesta si aparece en el texto (ej. "Rpta: B" o "Clave: A"). Si no aparece, pon "N/A".
+        4. Clasifica la especialidad médica (Medicina Interna, Cirugía General, Pediatría, Gineco-Obstetricia, etc.).
 
-            if len(opciones_match) >= 9:
-                enunciado = re.sub(r'\s+', ' ', opciones_match[0].strip())
-                opciones = []
-                for j in range(1, len(opciones_match), 2):
-                    letra = opciones_match[j]
-                    texto_op_bruto = opciones_match[j+1].strip()
-                    texto_op_bruto = re.sub(r'\n?\s*(?:Respuesta|Rpta|Clave)[\s\:\.]*[A-E].*$', '', texto_op_bruto, flags=re.IGNORECASE | re.DOTALL).strip()
-                    texto_op_unido = re.sub(r'\s*\n\s*', ' ', texto_op_bruto)
-                    opciones.append(f"{letra}) {texto_op_unido}")
+        FRAGMENTO DE TEXTO:
+        {chunk}
 
-                if len(opciones) >= 4:
-                    match_resp = re.search(r'(?:Respuesta|Rpta|Clave)[\s\:\.]*([A-E])', cuerpo, re.IGNORECASE)
-                    clave_real = match_resp.group(1).upper() if match_resp else "N/A"
+        Devuelve la respuesta ESTRICTAMENTE en formato JSON como una lista de objetos, sin texto adicional:
+        [
+          {{
+            "pregunta": "Enunciado completo...",
+            "opciones": ["A) ...", "B) ...", "C) ...", "D) ...", "E) ..."],
+            "correcta": "Letra o N/A",
+            "especialidad": "Especialidad"
+          }}
+        ]
+        """
+        try:
+            texto_resp, _ = generar_respuesta_con_fallback(prompt_parser)
+            t_limpio = texto_resp.strip()
+            if t_limpio.startswith("```json"):
+                t_limpio = t_limpio[7:]
+            elif t_limpio.startswith("```"):
+                t_limpio = t_limpio[3:]
+            if t_limpio.endswith("```"):
+                t_limpio = t_limpio[:-3]
+            
+            i, j = t_limpio.find("["), t_limpio.rfind("]")
+            if i != -1 and j != -1:
+                parcial = json.loads(t_limpio[i:j+1])
+                if isinstance(parcial, list):
+                    banco_preguntas.extend(parcial)
+        except Exception:
+            continue
 
-                    especialidad = "Medicina General"
-                    enunciado_lower = enunciado.lower()
-                    if any(k in enunciado_lower for k in ["niño", "infante", "recién nacido", "pediatra"]): especialidad = "Pediatría"
-                    elif any(k in enunciado_lower for k in ["gestante", "embarazada", "útero", "parto"]): especialidad = "Gineco-Obstetricia"
-                    elif any(k in enunciado_lower for k in ["dolor", "abdomen agudo", "cirugía", "apendicitis"]): especialidad = "Cirugía General"
-                    elif any(k in enunciado_lower for k in ["fiebre", "tos", "disnea", "pulmón", "infarto"]): especialidad = "Medicina Interna"
-
-                    banco_preguntas.append({
-                        "pregunta": enunciado,
-                        "opciones": opciones[:5],
-                        "correcta": clave_real,
-                        "especialidad": especialidad,
-                    })
     return banco_preguntas
 
 # ==========================================
@@ -226,7 +227,6 @@ def main_app():
         carpeta_base = carpetas_admin if opcion_menu == "Panel de Admin" else carpetas_usuario
 
         tipo_subida = st.radio("¿Qué tipo de material vas a subir?", ["Banco de Preguntas", "Material Teórico (Cerebro AI)"], horizontal=True)
-        # NUEVO: Se agregaron extensiones de imágenes
         archivos_subidos = st.file_uploader("Selecciona documentos", type=["pdf", "pptx", "ppt", "jpg", "jpeg", "png"], accept_multiple_files=True)
 
         if archivos_subidos:
@@ -434,7 +434,7 @@ def main_app():
                         with open(ruta_json, "r", encoding="utf-8") as f:
                             preguntas_extraidas = json.load(f)
                     else:
-                        with st.spinner("Procesando banco..."):
+                        with st.spinner("Procesando banco con IA (leyendo completo)..."):
                             preguntas_extraidas = extraer_preguntas_local_pdf(ruta_completa)
                             with open(ruta_json, "w", encoding="utf-8") as f:
                                 json.dump(preguntas_extraidas, f, ensure_ascii=False, indent=4)
