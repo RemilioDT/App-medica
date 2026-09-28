@@ -95,47 +95,54 @@ def extraer_preguntas_local_pdf(ruta_archivo):
             for i, pagina in enumerate(pdf.pages):
                 t = pagina.extract_text()
                 if t: 
-                    texto_total += f"\n[Página {i+1}]\n{t}\n"
+                    # Filtramos los encabezados y pies repetitivos del examen oficial
+                    lineas = t.split("\n")
+                    lineas_limpias = [
+                        l for l in lineas 
+                        if "Examen Nacional de Medicina" not in l 
+                        and "Página" not in l 
+                        and "07 de diciembre" not in l
+                    ]
+                    texto_limpio_pag = "\n".join(lineas_limpias)
+                    texto_total += f"\n--- PÁGINA {i+1} ---\n{texto_limpio_pag}\n"
     elif ruta_archivo.lower().endswith((".pptx", ".ppt", ".png", ".jpg", ".jpeg")):
         texto_total = extraer_texto_plano_con_paginas(ruta_archivo)
 
-    # PARSER ROBUSTO POR BLOQUES: Evita que las preguntas o respuestas se corten a la mitad
-    tamano_chunk = 8000
+    # PARSER ROBUSTO POR BLOQUES DINÁMICOS
+    tamano_chunk = 4000
     chunks = [texto_total[i:i+tamano_chunk] for i in range(0, len(texto_total), tamano_chunk)]
     banco_preguntas = []
 
-    for chunk in chunks:
+    for idx, chunk in enumerate(chunks):
         prompt_parser = f"""
-        Eres un procesador experto de exámenes médicos (ENAM / Residentado).
-        Analiza el siguiente fragmento de texto de un banco de preguntas y extrae TODAS las preguntas de opción múltiple.
+        Eres un procesador experto de exámenes médicos oficiales (ENAM / Residentado).
+        Analiza el siguiente texto (bloque {idx+1} de {len(chunks)}) y extrae TODAS las preguntas de opción múltiple.
         REGLAS CRÍTICAS:
-        1. NO recortes ni dejes a medias los enunciados ni las opciones. Deben estar COMPLETOS.
-        2. Cada pregunta debe tener sus 5 opciones (A, B, C, D, E) completas.
-        3. Identifica la clave de respuesta si aparece en el texto (ej. "Rpta: B" o "Clave: A"). Si no aparece, pon "N/A".
+        1. NO recortes ni dejes a medias los enunciados. Deben estar COMPLETOS.
+        2. Extrae ÚNICAMENTE las alternativas reales que existan en el texto para cada pregunta (pueden ser 4 o 5 opciones: A, B, C, D o E). NO inventes ni agregues alternativas falsas si el examen solo contempla 4.
+        3. Identifica la clave de respuesta si aparece en el texto. Si no hay clave explícita, pon "N/A".
         4. Clasifica la especialidad médica (Medicina Interna, Cirugía General, Pediatría, Gineco-Obstetricia, etc.).
-
-        FRAGMENTO DE TEXTO:
-        {chunk}
-
-        Devuelve la respuesta ESTRICTAMENTE en formato JSON como una lista de objetos, sin texto adicional:
+        5. DEVUELVE ÚNICAMENTE UN JSON VÁLIDO (una lista de objetos), sin bloques de código markdown ni texto adicional. Ejemplo:
         [
           {{
             "pregunta": "Enunciado completo...",
-            "opciones": ["A) ...", "B) ...", "C) ...", "D) ...", "E) ..."],
+            "opciones": ["A) ...", "B) ...", "C) ...", "D) ..."],
             "correcta": "Letra o N/A",
             "especialidad": "Especialidad"
           }}
         ]
+
+        TEXTO A ANALIZAR:
+        {chunk}
         """
         try:
             texto_resp, _ = generar_respuesta_con_fallback(prompt_parser)
             t_limpio = texto_resp.strip()
-            if t_limpio.startswith("```json"):
-                t_limpio = t_limpio[7:]
-            elif t_limpio.startswith("```"):
-                t_limpio = t_limpio[3:]
-            if t_limpio.endswith("```"):
-                t_limpio = t_limpio[:-3]
+            
+            if "```json" in t_limpio:
+                t_limpio = t_limpio.split("```json")[1].split("```")[0].strip()
+            elif "```" in t_limpio:
+                t_limpio = t_limpio.split("```")[1].split("```")[0].strip()
             
             i, j = t_limpio.find("["), t_limpio.rfind("]")
             if i != -1 and j != -1:
