@@ -1,0 +1,8 @@
+streamlit
+google-generativeai
+openai
+pdfplumber
+python-pptx
+matplotlib
+httpx
+Pillow
