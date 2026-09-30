@@ -53,36 +53,42 @@ def guardar_usuarios(db):
         json.dump(db, f, indent=4)
 
 # ==========================================
-# 2. MOTOR DE EXTRACCIÓN INTELIGENTE DE COLUMNAS
+# 2. MOTOR DE EXTRACCIÓN INTELIGENTE DE COLUMNAS (OPTIMIZADO PARA RAM Y MÁRGENES)
 # ==========================================
 def leer_pagina_inteligente(pagina):
-    """Detecta automáticamente columnas ignorando encabezados largos."""
-    ancho = pagina.width
-    alto = pagina.height
+    """Detecta automáticamente columnas, ignora encabezados, respeta márgenes reales y limpia la RAM."""
+    # Extraemos los límites exactos de la página actual para evitar el ValueError
+    x0, top, x1, bottom = pagina.bbox
+    ancho = x1 - x0
+    alto = bottom - top
     
     palabras = pagina.extract_words()
     if not palabras:
-        return pagina.extract_text() or ""
+        texto = pagina.extract_text() or ""
+        pagina.flush_cache() # Libera RAM
+        return texto
         
-    zona_muerta_izq = ancho * 0.45
-    zona_muerta_der = ancho * 0.55
+    zona_muerta_izq = x0 + (ancho * 0.45)
+    zona_muerta_der = x0 + (ancho * 0.55)
     
     # Ignoramos el 8% superior e inferior para que los encabezados largos no arruinen la detección de columnas
-    palabras_centro = [p for p in palabras if p['top'] > alto * 0.08 and p['bottom'] < alto * 0.92]
-    
+    palabras_centro = [p for p in palabras if p['top'] > top + (alto * 0.08) and p['bottom'] < top + (alto * 0.92)]
     cruza_centro = sum(1 for p in palabras_centro if p['x0'] < zona_muerta_izq and p['x1'] > zona_muerta_der)
     
-    # Si muy pocas palabras cruzan el centro de la página, es un PDF de 2 columnas seguro
     if cruza_centro <= 4:
-        caja_izq = (0, 0, ancho * 0.5, alto)
-        caja_der = (ancho * 0.5, 0, ancho, alto)
+        centro_x = x0 + (ancho * 0.5)
+        # Usamos strict=False para tolerar desajustes milimétricos en los márgenes del PDF
+        caja_izq = (x0, top, centro_x, bottom)
+        caja_der = (centro_x, top, x1, bottom)
         
-        texto_izq = pagina.crop(caja_izq).extract_text() or ""
-        texto_der = pagina.crop(caja_der).extract_text() or ""
-        
-        return texto_izq + "\n" + texto_der
+        texto_izq = pagina.crop(caja_izq, strict=False).extract_text() or ""
+        texto_der = pagina.crop(caja_der, strict=False).extract_text() or ""
+        resultado = texto_izq + "\n" + texto_der
     else:
-        return pagina.extract_text() or ""
+        resultado = pagina.extract_text() or ""
+        
+    pagina.flush_cache() # <--- CRÍTICO: Limpia la memoria de la página después de leerla
+    return resultado
 
 def extraer_texto_plano_con_paginas(ruta_archivo):
     texto_total = ""
@@ -165,6 +171,13 @@ def extraer_preguntas_local_pdf(ruta_archivo):
                     continue
                 letras_vistas.add(letra)
                 
+                # REGLA DE LIMPIEZA: Si se coló un trozo del enunciado en la A
+                if letra == 'A' and not re.search(r'[\?\:]\s*$', enunciado) and len(texto_op) > 40:
+                    corte_idx = max(texto_op.rfind('.'), texto_op.rfind('?'), texto_op.rfind(':'))
+                    if corte_idx != -1 and corte_idx < len(texto_op) // 2:
+                        enunciado += " " + texto_op[:corte_idx+1]
+                        texto_op = texto_op[corte_idx+1:].strip()
+
                 opciones.append(f"{letra}) {texto_op}")
             
             if len(opciones) >= 3:
